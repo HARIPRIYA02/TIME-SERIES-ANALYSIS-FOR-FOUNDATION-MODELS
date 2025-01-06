@@ -1,0 +1,18 @@
+#smape calculation for https://github.com/thuml/Time-Series-Library/blob/4d69a77011e688a133f83867453ae940e1988568/exp/exp_long_term_forecasting.py
+calculate_smape = True
+ if calculate_smape:
+       predsw = preds.reshape(-1, preds.shape[-1])
+       truesw = trues.reshape(-1, trues.shape[-1])
+       predsa = np.tile(predsw, (1,7))
+       truesa = np.tile(truesw, (1,7))
+
+       predsxe = test_data.inverse_transform(predsa)
+       truesxe = test_data.inverse_transform(truesa)
+       predsx = predsxe.reshape(-1, predsxe.shape[-2], predsxe.shape[-1])
+       truesx = truesxe.reshape(-1, truesxe.shape[-2], truesxe.shape[-1])
+       predsx = predsx[:,:,-1]
+       truesx = truesx[:,:,-1]
+       print(truesx.shape)
+       # Calculate SMAPE
+       smape = np.mean(200 * np.abs(predsx - truesx) / (np.abs(predsx) + np.abs(truesx)))
+       print('SMAPE:', smape)
