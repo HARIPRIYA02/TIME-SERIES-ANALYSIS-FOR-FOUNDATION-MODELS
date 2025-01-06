@@ -1,0 +1,248 @@
+import psycopg2
+import pandas as pd
+from statsmodels.tsa.seasonal import seasonal_decompose
+from scipy.spatial.distance import euclidean
+from fastdtw import fastdtw
+import os
+import re
+from dotenv import load_dotenv, find_dotenv
+import matplotlib.pyplot as plt
+
+# Load environment variables
+_ = load_dotenv(find_dotenv(), override=True)
+service_url = "x"  # Replace with your TimescaleDB service URL
+
+
+class StandardScaler:
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+
+    def transform(self, data):
+        return (data - self.mean) / self.std
+
+    def inverse_transform(self, data):
+        return (data * self.std) + self.mean
+
+
+def identify_date_column(df):
+    date_candidates = {}
+    date_pattern = re.compile(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}( \d{1,2}:\d{2}(:\d{2})?)?$')
+
+    for column in df.columns:
+        try:
+            parsed = pd.to_datetime(df[column], errors="coerce")
+            valid_ratio = parsed.notnull().sum() / len(parsed)
+            if valid_ratio >= 0.9:
+                date_candidates[column] = valid_ratio
+        except Exception:
+            continue
+
+    if date_candidates:
+        return max(date_candidates, key=date_candidates.get)
+    raise ValueError("No date or timestamp column found in the DataFrame.")
+
+
+def calculate_decomposition(df, column_name, period=12):
+    decomposition = seasonal_decompose(df[column_name], period=period, model="additive", extrapolate_trend="freq")
+    df["trend"] = decomposition.trend
+    df["seasonal"] = decomposition.seasonal
+    df["residual"] = decomposition.resid
+    return df
+
+
+def normalize_series(series):
+    mean = series.mean()
+    std = series.std()
+    scaler = StandardScaler(mean, std)
+    normalized_series = scaler.transform(series)
+    return normalized_series, scaler
+
+
+def normalize_decomposed_components(df):
+    df["trend_normalized"], _ = normalize_series(df["trend"].fillna(0))
+    df["seasonal_normalized"], _ = normalize_series(df["seasonal"].fillna(0))
+    df["residual_normalized"], _ = normalize_series(df["residual"].fillna(0))
+    return df
+
+
+def normalize_column(df, column_name):
+    """
+    Normalize a specific column in the DataFrame.
+    """
+    df[column_name], _ = normalize_series(df[column_name].fillna(0))
+    return df
+
+
+def calculate_dtw_distance(series1, series2):
+    """
+    Calculate the DTW distance between two multidimensional series.
+    """
+    distance, _ = fastdtw(series1, series2, dist=euclidean)
+    return distance
+
+
+def store_decomposed_data_in_db(file, table_name):
+    """
+    Process and store decomposed and normalized data into a TimescaleDB hypertable with a series name.
+    """
+    series_name = os.path.basename(file).split('.')[0]  # Extract series name from file name
+    df = pd.read_csv(file)
+
+    # Identify and rename the date column
+    date_column = identify_date_column(df)
+    df.rename(columns={date_column: "date"}, inplace=True)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # Normalize the value column
+    target_column = "value"
+    df = normalize_column(df, target_column)
+
+    # Decompose and normalize the components
+    df = calculate_decomposition(df, target_column)
+    df = normalize_decomposed_components(df)
+
+    # Add series name column
+    df["series_name"] = series_name
+
+    # Reset index and prepare column types for database
+    df.reset_index(inplace=True)
+    df.rename(columns={"index": "id"}, inplace=True)
+
+    # Define column types
+    column_types = {
+        col: "DOUBLE PRECISION" if pd.api.types.is_numeric_dtype(df[col])
+        else "TIMESTAMPTZ" if pd.api.types.is_datetime64_any_dtype(df[col])
+        else "TEXT"
+        for col in df.columns
+    }
+
+    # Prepare SQL columns definition
+    columns_in_order = ["id", "date", "series_name", "trend_normalized", "seasonal_normalized", "residual_normalized"] + [
+        col for col in df.columns if col not in {"id", "date", "series_name", "trend_normalized", "seasonal_normalized", "residual_normalized"}
+    ]
+    sql_columns = [f'{col} {column_types[col]}' for col in columns_in_order]
+
+    # Connect to the database and create the hypertable
+    with psycopg2.connect(service_url) as conn:
+        with conn.cursor() as cursor:
+            # Drop table if it exists
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+            # Create the table
+            cursor.execute(f"""
+                CREATE TABLE {table_name} (
+                    {', '.join(sql_columns)}
+                );
+            """)
+
+            # Convert the table into a hypertable
+            cursor.execute(f"SELECT create_hypertable('{table_name}', 'date', if_not_exists => TRUE);")
+
+            # Insert data into the hypertable
+            for _, row in df.iterrows():
+                row_data = [row[col] if col in df.columns else None for col in columns_in_order]
+                cursor.execute(
+                    f"""
+                    INSERT INTO {table_name} ({', '.join(columns_in_order)})
+                    VALUES ({', '.join(['%s'] * len(columns_in_order))});
+                    """,
+                    tuple(row_data),
+                )
+            conn.commit()
+
+    print(f"Decomposed and normalized data from {file} has been successfully inserted into the hypertable {table_name}.")
+    return df
+
+
+def plot_time_series(input_dates, input_values, matched_dates, matched_values, similarity_score, input_file,
+                     matched_table):
+    """
+    Plot the input series and matched series with similarity score, using date and value columns.
+    """
+    plt.figure(figsize=(12, 6))
+    plt.plot(input_dates, input_values, label='Input Series', color='blue', linestyle='--')
+    plt.plot(matched_dates, matched_values, label='Matched Series', color='orange')
+    plt.title(f"Similarity Score: {similarity_score:.2f}\n(Input: {input_file}, Matched: {matched_table})")
+    plt.xlabel('Date')
+    plt.ylabel('Normalized Value')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def find_similar_time_series_with_plotting(input_csv_file, n_neighbors=1):
+    """
+    Find similar time series by comparing DTW distances between decomposed components
+    and plot the input vs matched series with dates and values.
+    """
+    df = pd.read_csv(input_csv_file)
+    date_column = identify_date_column(df)
+    df.rename(columns={date_column: "date"}, inplace=True)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # Normalize the value column
+    target_column = "value"
+    df = normalize_column(df, target_column)
+
+    # Decompose and normalize the components
+    df = calculate_decomposition(df, target_column)
+    df = normalize_decomposed_components(df)
+
+    # Combine all normalized components into a multidimensional series
+    input_series = df[["trend_normalized", "seasonal_normalized", "residual_normalized"]].fillna(0).values.tolist()
+    input_dates = df["date"].tolist()
+    input_values = df[target_column].tolist()
+
+    embedding_collections = []
+    with psycopg2.connect(service_url) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname = 'public' AND tablename LIKE '%decomposed_data%';
+            """)
+            embedding_collections = [row[0] for row in cursor.fetchall()]
+
+    all_results = []
+    for table_name in embedding_collections:
+        with psycopg2.connect(service_url) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT series_name, date, value, trend_normalized, seasonal_normalized, residual_normalized 
+                    FROM {table_name};
+                """)
+                stored_series = pd.DataFrame(cursor.fetchall(),
+                                             columns=["series_name", "date", "value", "trend_normalized", "seasonal_normalized", "residual_normalized"])
+                stored_series["date"] = pd.to_datetime(stored_series["date"], errors="coerce")
+                stored_series = stored_series.dropna()
+
+                series_name = stored_series["series_name"].iloc[0]  # Extract the series name
+                stored_series_combined = stored_series[["trend_normalized", "seasonal_normalized", "residual_normalized"]].fillna(0).values.tolist()
+                distance = calculate_dtw_distance(input_series, stored_series_combined)
+                all_results.append((series_name, distance, stored_series))
+
+    # Sort by similarity and plot the most similar series
+    sorted_results = sorted(all_results, key=lambda x: x[1])[:n_neighbors]
+
+    for series_name, similarity_score, matched_series_df in sorted_results:
+        matched_dates = matched_series_df["date"].tolist()
+        matched_values = matched_series_df["value"].tolist()
+        plot_time_series(input_dates, input_values, matched_dates, matched_values, similarity_score, input_csv_file, series_name)
+
+    return [(series_name, similarity_score) for series_name, similarity_score, _ in sorted_results]
+
+
+# Process and store each file
+csv_files = [
+    "C:/Users/mhari/PycharmProjects/Flaskbackend/alabama new.csv",
+    "C:/Users/mhari/PycharmProjects/Flaskbackend/alaska new.csv",
+]
+for i, file in enumerate(csv_files):
+    table_name = f"decomposed_data_{i + 1}"
+    store_decomposed_data_in_db(file, table_name)
+
+# Find similar time series
+input_csv_file = "C:/Users/mhari/PycharmProjects/Flaskbackend/national new.csv"
+similar_series_with_plots = find_similar_time_series_with_plotting(input_csv_file, n_neighbors=1)
+print("Similar time series with plots generated:", similar_series_with_plots)
