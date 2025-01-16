@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 # Load environment variables
 _ = load_dotenv(find_dotenv(), override=True)
-service_url = "x"  # Replace with your TimescaleDB service URL
+service_url = "Replace with your TimescaleDB service URL"
 
 
 class StandardScaler:
@@ -27,8 +27,6 @@ class StandardScaler:
 
 def identify_date_column(df):
     date_candidates = {}
-    date_pattern = re.compile(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}( \d{1,2}:\d{2}(:\d{2})?)?$')
-
     for column in df.columns:
         try:
             parsed = pd.to_datetime(df[column], errors="coerce")
@@ -67,26 +65,17 @@ def normalize_decomposed_components(df):
 
 
 def normalize_column(df, column_name):
-    """
-    Normalize a specific column in the DataFrame.
-    """
     df[column_name], _ = normalize_series(df[column_name].fillna(0))
     return df
 
 
 def calculate_dtw_distance(series1, series2):
-    """
-    Calculate the DTW distance between two multidimensional series.
-    """
     distance, _ = fastdtw(series1, series2, dist=euclidean)
     return distance
 
 
-def store_decomposed_data_in_db(file, table_name):
-    """
-    Process and store decomposed and normalized data into a TimescaleDB hypertable with a series name.
-    """
-    series_name = os.path.basename(file).split('.')[0]  # Extract series name from file name
+def store_decomposed_data_in_db(file, table_name, target_column):
+    series_name = os.path.basename(file).split('.')[0]
     df = pd.read_csv(file)
 
     # Identify and rename the date column
@@ -94,8 +83,7 @@ def store_decomposed_data_in_db(file, table_name):
     df.rename(columns={date_column: "date"}, inplace=True)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-    # Normalize the value column
-    target_column = "value"
+    # Normalize the target column dynamically
     df = normalize_column(df, target_column)
 
     # Decompose and normalize the components
@@ -126,27 +114,13 @@ def store_decomposed_data_in_db(file, table_name):
     # Connect to the database and create the hypertable
     with psycopg2.connect(service_url) as conn:
         with conn.cursor() as cursor:
-            # Drop table if it exists
             cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-
-            # Create the table
-            cursor.execute(f"""
-                CREATE TABLE {table_name} (
-                    {', '.join(sql_columns)}
-                );
-            """)
-
-            # Convert the table into a hypertable
+            cursor.execute(f"CREATE TABLE {table_name} ({', '.join(sql_columns)});")
             cursor.execute(f"SELECT create_hypertable('{table_name}', 'date', if_not_exists => TRUE);")
-
-            # Insert data into the hypertable
             for _, row in df.iterrows():
                 row_data = [row[col] if col in df.columns else None for col in columns_in_order]
                 cursor.execute(
-                    f"""
-                    INSERT INTO {table_name} ({', '.join(columns_in_order)})
-                    VALUES ({', '.join(['%s'] * len(columns_in_order))});
-                    """,
+                    f"INSERT INTO {table_name} ({', '.join(columns_in_order)}) VALUES ({', '.join(['%s'] * len(columns_in_order))});",
                     tuple(row_data),
                 )
             conn.commit()
@@ -155,34 +129,13 @@ def store_decomposed_data_in_db(file, table_name):
     return df
 
 
-def plot_time_series(input_dates, input_values, matched_dates, matched_values, similarity_score, input_file,
-                     matched_table):
-    """
-    Plot the input series and matched series with similarity score, using date and value columns.
-    """
-    plt.figure(figsize=(12, 6))
-    plt.plot(input_dates, input_values, label='Input Series', color='blue', linestyle='--')
-    plt.plot(matched_dates, matched_values, label='Matched Series', color='orange')
-    plt.title(f"Similarity Score: {similarity_score:.2f}\n(Input: {input_file}, Matched: {matched_table})")
-    plt.xlabel('Date')
-    plt.ylabel('Normalized Value')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-
-def find_similar_time_series_with_plotting(input_csv_file, n_neighbors=1):
-    """
-    Find similar time series by comparing DTW distances between decomposed components
-    and plot the input vs matched series with dates and values.
-    """
+def find_similar_time_series_with_plotting(input_csv_file, target_column, n_neighbors=1):
     df = pd.read_csv(input_csv_file)
     date_column = identify_date_column(df)
     df.rename(columns={date_column: "date"}, inplace=True)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-    # Normalize the value column
-    target_column = "value"
+    # Normalize the target column dynamically
     df = normalize_column(df, target_column)
 
     # Decompose and normalize the components
@@ -209,15 +162,15 @@ def find_similar_time_series_with_plotting(input_csv_file, n_neighbors=1):
         with psycopg2.connect(service_url) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(f"""
-                    SELECT series_name, date, value, trend_normalized, seasonal_normalized, residual_normalized 
+                    SELECT series_name, date, {target_column}, trend_normalized, seasonal_normalized, residual_normalized 
                     FROM {table_name};
                 """)
                 stored_series = pd.DataFrame(cursor.fetchall(),
-                                             columns=["series_name", "date", "value", "trend_normalized", "seasonal_normalized", "residual_normalized"])
+                                             columns=["series_name", "date", target_column, "trend_normalized", "seasonal_normalized", "residual_normalized"])
                 stored_series["date"] = pd.to_datetime(stored_series["date"], errors="coerce")
                 stored_series = stored_series.dropna()
 
-                series_name = stored_series["series_name"].iloc[0]  # Extract the series name
+                series_name = stored_series["series_name"].iloc[0]
                 stored_series_combined = stored_series[["trend_normalized", "seasonal_normalized", "residual_normalized"]].fillna(0).values.tolist()
                 distance = calculate_dtw_distance(input_series, stored_series_combined)
                 all_results.append((series_name, distance, stored_series))
@@ -227,22 +180,92 @@ def find_similar_time_series_with_plotting(input_csv_file, n_neighbors=1):
 
     for series_name, similarity_score, matched_series_df in sorted_results:
         matched_dates = matched_series_df["date"].tolist()
-        matched_values = matched_series_df["value"].tolist()
+        matched_values = matched_series_df[target_column].tolist()
         plot_time_series(input_dates, input_values, matched_dates, matched_values, similarity_score, input_csv_file, series_name)
 
     return [(series_name, similarity_score) for series_name, similarity_score, _ in sorted_results]
 
 
-# Process and store each file
-csv_files = [
-    "C:/Users/mhari/PycharmProjects/Flaskbackend/alabama new.csv",
-    "C:/Users/mhari/PycharmProjects/Flaskbackend/alaska new.csv",
-]
+def plot_time_series(input_dates, input_values, matched_dates, matched_values, similarity_score, input_file, matched_table):
+    plt.figure(figsize=(12, 6))
+    plt.plot(input_dates, input_values, label='Input Series', color='blue', linestyle='--')
+    plt.plot(matched_dates, matched_values, label='Matched Series', color='orange')
+    plt.title(f"Similarity Score: {similarity_score:.2f}\n(Input: {input_file}, Matched: {matched_table})")
+    plt.xlabel('Date')
+    plt.ylabel('Normalized Value')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def drop_all_existing_tables():
+    with psycopg2.connect(service_url) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname = 'public' AND tablename LIKE 'decomposed_data_%';
+            """)
+            tables_to_drop = [row[0] for row in cursor.fetchall()]
+            for table_name in tables_to_drop:
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+            conn.commit()
+    print(f"Dropped {len(tables_to_drop)} tables.")
+
+
+# Step 1: Enter CSV file paths at runtime
+csv_files_input = input("Enter the CSV file paths separated by commas: ")
+csv_files = [file.strip() for file in csv_files_input.split(",")]
+
+# Step 2: Validate file paths
+for file in csv_files:
+    if not os.path.exists(file):
+        print(f"File does not exist: {file}")
+        exit(1)
+
+# Step 3: Dynamically retrieve target column for processing
+df_sample = pd.read_csv(csv_files[0])  # Load the first file to display available columns
+print(f"Available columns in the dataset: {', '.join(df_sample.columns)}")
+target_column = input("Enter the name of the target column to process: ").strip()
+
+# Validate the target column in all CSV files
+for file in csv_files:
+    df = pd.read_csv(file)
+    if target_column not in df.columns:
+        print(f"Column '{target_column}' does not exist in file: {file}")
+        exit(1)
+
+# Step 4: Process and store files
+drop_all_existing_tables()
 for i, file in enumerate(csv_files):
     table_name = f"decomposed_data_{i + 1}"
-    store_decomposed_data_in_db(file, table_name)
+    store_decomposed_data_in_db(file, table_name, target_column)
 
-# Find similar time series
-input_csv_file = "C:/Users/mhari/PycharmProjects/Flaskbackend/national new.csv"
-similar_series_with_plots = find_similar_time_series_with_plotting(input_csv_file, n_neighbors=1)
+# Step 5: Enter input CSV file for similarity search
+input_csv_file = input("Enter the input CSV file path for similarity search: ").strip()
+if not os.path.exists(input_csv_file):
+    print(f"Input file does not exist: {input_csv_file}")
+    exit(1)
+
+# Step 6: Ask for the target column for the input file
+df_input = pd.read_csv(input_csv_file)
+print(f"Available columns in the input file: {', '.join(df_input.columns)}")
+input_target_column = input("Enter the name of the target column for similarity search: ").strip()
+
+# Validate the target column in the input file
+if input_target_column not in df_input.columns:
+    print(f"Column '{input_target_column}' does not exist in the input file.")
+    exit(1)
+
+# Step 7: Enter the number of similar series to find
+try:
+    n_neighbors = int(input("Enter the number of similar series to find (top X similarity): ").strip())
+    if n_neighbors <= 0:
+        raise ValueError("The number of neighbors must be greater than zero.")
+except ValueError as e:
+    print(f"Invalid input for neighbors: {e}")
+    exit(1)
+
+# Step 8: Perform similarity search
+similar_series_with_plots = find_similar_time_series_with_plotting(input_csv_file, input_target_column, n_neighbors=n_neighbors)
 print("Similar time series with plots generated:", similar_series_with_plots)
